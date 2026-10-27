@@ -133,6 +133,17 @@ export function isTopLevelAgent(
 }
 
 /**
+ * Whether a status was written by an external stop — `abort()` ("stopped": a
+ * human or the parent's own cancellation) or `interrupt()` ("interrupted": the
+ * calling agent, keeping the session for a later resume). Both are set BEFORE
+ * the run settles, and the settle paths must not overwrite them with the
+ * run's own outcome, or the partial output reads as a finished result.
+ */
+export function isExternallyStopped(status: AgentRecord["status"]): boolean {
+  return status === "stopped" || status === "interrupted";
+}
+
+/**
  * Whether a record occupies one of the `maxConcurrentForeground` slots.
  *
  * Keyed on `blocking` — a caller awaiting this record inline — rather than on
@@ -932,8 +943,8 @@ export class AgentManager {
         return responseText;
       })
       .catch(async (err) => {
-        // Don't overwrite status if externally stopped via abort()
-        if (record.status !== "stopped") {
+        // Don't overwrite status if externally stopped via abort()/interrupt()
+        if (!isExternallyStopped(record.status)) {
           record.status = "error";
         }
         record.error = err instanceof Error ? err.message : String(err);
@@ -1295,7 +1306,7 @@ export class AgentManager {
     record: AgentRecord,
     { text, failure, aborted, steered }: Awaited<ReturnType<typeof resumeAgent>>,
   ): void {
-    if (record.status !== "stopped") {
+    if (!isExternallyStopped(record.status)) {
       if (aborted) {
         record.status = "aborted";
       } else if (failure) {
@@ -1311,7 +1322,7 @@ export class AgentManager {
 
   /** A resume whose runner rejected: an error, unless an external stop got there first. */
   private failResume(record: AgentRecord, err: unknown): void {
-    if (record.status !== "stopped") {
+    if (!isExternallyStopped(record.status)) {
       record.status = "error";
       record.error = err instanceof Error ? err.message : String(err);
     }
@@ -1524,6 +1535,30 @@ export class AgentManager {
     if (record.status !== "running") return false;
     record.abortController?.abort();
     record.status = "stopped";
+    record.completedAt = Date.now();
+    return true;
+  }
+
+  /**
+   * Force-stop a running agent on behalf of its caller, keeping it addressable.
+   *
+   * Same mechanism as `abort()` — the run's controller fires and the session
+   * aborts mid-turn — but the record lands on "interrupted" rather than
+   * "stopped": the session is kept (every settle path stores it), so the agent
+   * can still be read with get_subagent_result and continued with `resume`,
+   * and the status note tells the parent it was its own doing, not a human's.
+   *
+   * Running only. A queued agent has no session to come back to, so
+   * interrupting it would be an abort by another name — callers wanting that
+   * have `abort()`. The stop is asynchronous: the status flips here, the run
+   * settles when pi's loop unwinds. Await `record.promise` before resuming, or
+   * `session.prompt()` rejects with "already processing".
+   */
+  interrupt(id: string): boolean {
+    const record = this.agents.get(id);
+    if (!record || record.status !== "running") return false;
+    record.abortController?.abort();
+    record.status = "interrupted";
     record.completedAt = Date.now();
     return true;
   }

@@ -178,7 +178,7 @@ export interface AgentRecord {
    */
   alias?: string;
   description: string;
-  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "interrupted" | "error";
   result?: string;
   error?: string;
   toolUses: number;

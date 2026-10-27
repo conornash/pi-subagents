@@ -17,12 +17,15 @@ import type { AgentRecord } from "./types.js";
  *
  * `stopped` (a human aborted it) is deliberately distinct from `aborted` (the
  * turn limit was hit) — the parent should treat human intervention differently
- * from a budget cutoff.
+ * from a budget cutoff. `interrupted` is the parent's own interrupt_subagent
+ * call: the session was kept on purpose, so the note says it can be resumed.
  */
 export function getStatusNote(status: string): string {
   switch (status) {
     case "stopped":
       return " (STOPPED BY THE USER before completion — output is partial; the task was NOT finished)";
+    case "interrupted":
+      return " (interrupted by interrupt_subagent before completion — output is partial; the task was NOT finished; the session is intact and can be resumed)";
     case "aborted":
       return " (aborted — hit the turn limit before completion; output may be incomplete)";
     case "steered":
@@ -70,6 +73,8 @@ export function getForegroundOutcomeNote(status: string): string {
   switch (status) {
     case "stopped":
       return " (STOPPED BY THE USER — everything the agent produced is above; the task is unfinished)";
+    case "interrupted":
+      return " (interrupted by interrupt_subagent — everything the agent produced is above; the task is unfinished)";
     case "aborted":
       return " (aborted at the turn limit — everything the agent produced is above; the task is unfinished)";
     case "steered":

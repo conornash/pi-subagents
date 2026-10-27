@@ -21,7 +21,7 @@ const MAX_WIDGET_LINES = 12;
 export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /** Statuses that indicate an error/non-success outcome (used for linger behavior and icon rendering). */
-export const ERROR_STATUSES = new Set(["error", "aborted", "steered", "stopped"]);
+export const ERROR_STATUSES = new Set(["error", "aborted", "steered", "stopped", "interrupted"]);
 
 /** Tool name → human-readable action for activity descriptions. */
 const TOOL_DISPLAY: Record<string, string> = {
@@ -70,7 +70,7 @@ export interface AgentDetails {
   toolUses: number;
   tokens: string;
   durationMs: number;
-  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error" | "background";
+  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "interrupted" | "error" | "background";
   /** Human-readable description of what the agent is currently doing. */
   activity?: string;
   /** Current spinner frame index (for animated running indicator). */
@@ -384,9 +384,9 @@ export class AgentWidget {
     } else if (a.status === "steered") {
       icon = theme.fg("warning", "✓");
       statusText = theme.fg("warning", " (turn limit)");
-    } else if (a.status === "stopped") {
+    } else if (a.status === "stopped" || a.status === "interrupted") {
       icon = theme.fg("dim", "■");
-      statusText = theme.fg("dim", " stopped");
+      statusText = theme.fg("dim", a.status === "stopped" ? " stopped" : " interrupted");
     } else if (a.status === "error") {
       icon = theme.fg("error", "✗");
       const errMsg = a.error ? `: ${a.error.slice(0, 60)}` : "";

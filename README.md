@@ -550,6 +550,14 @@ Send a steering message to a running agent. The message interrupts after the cur
 | `agent_id` | string | yes | Agent ID to steer |
 | `message` | string | yes | Message to inject into agent conversation |
 
+### `interrupt_subagent`
+
+Force-stop a running agent now, without destroying it. Unlike a steer it does not wait for the current tool call and carries no message: the run's abort signal fires, the call waits (up to 10s) for the run to settle, and returns the partial output. The record lands on `interrupted` (distinct from a human `stopped`), its session is kept, and the agent can still be read with `get_subagent_result` and continued with `Agent({resume: agent_id, prompt})`. The caller ordered the stop and reads the outcome in the tool result, so no completion notification follows. Running agents only — a queued agent has no session to come back to.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent_id` | string | yes | Agent ID or handle to interrupt |
+
 ## Commands
 
 | Command | Description |

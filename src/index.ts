@@ -18,7 +18,7 @@ import { Type } from "typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AgentManager, isExternallyStopped, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { rowDescription, sourceIndicator, sourceLegend } from "./agent-source-badge.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
@@ -170,6 +170,7 @@ function getStatusLabel(status: string, error?: string): string {
     case "aborted": return "Aborted (max turns exceeded)";
     case "steered": return "Wrapped up (turn limit)";
     case "stopped": return "Stopped";
+    case "interrupted": return "Interrupted";
     default: return "Done";
   }
 }
@@ -319,7 +320,7 @@ export default function (pi: ExtensionAPI) {
       if (!d) return undefined;
 
       function renderOne(d: NotificationDetails): string {
-        const isError = d.status === "error" || d.status === "stopped" || d.status === "aborted";
+        const isError = d.status === "error" || isExternallyStopped(d.status as AgentRecord["status"]) || d.status === "aborted";
         const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
         const statusText = isError ? d.status
           : d.status === "steered" ? "completed (steered)"
@@ -578,7 +579,7 @@ export default function (pi: ExtensionAPI) {
     if (!isTopLevelAgent(record)) return;
 
     // Emit lifecycle event based on terminal status
-    const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
+    const isError = record.status === "error" || isExternallyStopped(record.status) || record.status === "aborted";
     const eventData = buildEventData(record);
     if (isError) {
       pi.events.emit("subagents:failed", eventData);
@@ -1677,6 +1678,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
+- Use interrupt_subagent to force-stop a running background agent at once without discarding it: its session and partial output are kept, and you can continue it later with resume. Use it when a steer is too slow (the agent must stop NOW) or when you need its session idle before giving it a new prompt.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
@@ -1910,11 +1912,11 @@ Terse command-style prompts produce shallow, generic work.
         return new Text(line, 0, 0);
       }
 
-      // ---- Stopped (user-initiated abort) ----
-      if (details.status === "stopped") {
+      // ---- Stopped (user-initiated abort) / Interrupted (caller's interrupt_subagent) ----
+      if (details.status === "stopped" || details.status === "interrupted") {
         const s = stats(details);
         let line = theme.fg("dim", "■") + (s ? " " + s : "");
-        line += "\n" + theme.fg("dim", "  ⎿  Stopped");
+        line += "\n" + theme.fg("dim", details.status === "stopped" ? "  ⎿  Stopped" : "  ⎿  Interrupted (resumable)");
         return new Text(line, 0, 0);
       }
 
@@ -3102,6 +3104,80 @@ Terse command-style prompts produce shallow, generic work.
       } catch (err) {
         return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
       }
+    },
+  }));
+
+  // ---- interrupt_subagent tool ----
+
+  /**
+   * How long the tool waits for the interrupted run to settle before returning
+   * anyway. pi's loop unwinds on the next await after `session.abort()`,
+   * normally milliseconds, but a tool that ignores its signal can take longer,
+   * so the caller is told the stop is still landing rather than being held.
+   */
+  const INTERRUPT_SETTLE_TIMEOUT_MS = 10_000;
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.INTERRUPT,
+    label: "Interrupt Agent",
+    description:
+      "Force-stop a running agent immediately. Unlike steer_subagent this does not wait for the current tool call to finish " +
+      "and gives it no message. The agent is NOT destroyed: its session and partial output are kept, so you can read it with " +
+      "get_subagent_result and continue it later with Agent({resume: agent_id, prompt}). Only works on running agents.",
+    promptSnippet: "Force-stop a running background agent now, keeping it resumable",
+    parameters: Type.Object({
+      agent_id: Type.String({
+        description: "The agent ID to interrupt (must be currently running). The agent's handle also works: its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      const record = resolveAgentRef(params.agent_id);
+      if (!record || !isTopLevelAgent(record)) {
+        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      }
+      if (record.status !== "running") {
+        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Nothing to interrupt.`);
+      }
+
+      // The caller asked for this stop and reads the outcome from this very
+      // result, so the completion path must not also raise a notification
+      // that would nudge the caller a second time about a stop it ordered.
+      record.resultConsumed = true;
+      if (!manager.interrupt(record.id)) {
+        return textResult(`Agent "${params.agent_id}" could not be interrupted (status: ${record.status}).`);
+      }
+      pi.events.emit("subagents:interrupted", { id: record.id });
+
+      // Wait for the run to actually settle: until it does, the session is
+      // still "processing" and a resume would be refused. Bounded, so a tool
+      // that ignores its abort signal can't hold the caller indefinitely.
+      let settled = true;
+      if (record.promise) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), INTERRUPT_SETTLE_TIMEOUT_MS);
+          timer.unref?.();
+        });
+        settled = await Promise.race([record.promise.then(() => true), timeout]);
+        if (timer) clearTimeout(timer);
+      }
+
+      const tokens = formatLifetimeTokens(record);
+      const stateParts: string[] = [];
+      if (tokens) stateParts.push(tokens);
+      stateParts.push(`${record.toolUses} tool ${record.toolUses === 1 ? "use" : "uses"}`);
+      if (record.compactionCount) stateParts.push(`${record.compactionCount} compaction${record.compactionCount === 1 ? "" : "s"}`);
+
+      const partial = settled ? (record.result?.trim() ?? "") : "";
+      const preview = partial.length > 1000 ? partial.slice(0, 1000) + "\n... (truncated; get_subagent_result has the rest)" : partial;
+      return textResult(
+        (settled
+          ? `Interrupted agent ${record.id}. Its run has stopped; the session is intact.\n`
+          : `Interrupt requested for agent ${record.id}, but its run has not settled within ${INTERRUPT_SETTLE_TIMEOUT_MS / 1000}s. Check get_subagent_result before resuming.\n`) +
+        `State at interrupt: ${stateParts.join(" \u00b7 ")}\n` +
+        (preview ? `\nPartial output before the interrupt:\n${preview}\n` : "") +
+        `\nResume with Agent({resume: "${record.id}", prompt: ...}), or read it with get_subagent_result.`,
+      );
     },
   }));
 
